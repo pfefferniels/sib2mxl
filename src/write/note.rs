@@ -7,9 +7,20 @@ use crate::xml::Xml;
 pub struct Voice {
     pub number: u8,
     pub staff: Option<usize>,
+    pub staves: usize,
 }
 
 impl Voice {
+    /// The staff an event is drawn on: its own, or the neighbouring staff of
+    /// the same part for a cross-staff note.
+    fn staff_of(&self, event: &Event) -> Option<usize> {
+        let staff = self.staff?;
+        let crossed = staff
+            .checked_add_signed(isize::from(event.cross_staff))
+            .filter(|crossed| (1..=self.staves).contains(crossed));
+        Some(crossed.unwrap_or(staff))
+    }
+
     pub fn write(&self, xml: &mut Xml) {
         xml.text("voice", &[], &self.number.to_string());
         if let Some(staff) = self.staff {
@@ -67,8 +78,26 @@ fn note(xml: &mut Xml, event: &Event, head: Head, chord: bool, voice: &Voice, du
             );
             (0..event.value.dots).for_each(|_| xml.empty("dot", &[]));
         }
+        if let Head::Note(Note {
+            accidental: Some(accidental),
+            ..
+        }) = head
+        {
+            let yes = |set: bool| set.then_some("yes");
+            let attributes: Vec<(&str, &str)> = [
+                ("cautionary", yes(accidental.cautionary)),
+                ("parentheses", yes(accidental.parentheses)),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value?)))
+            .collect();
+            xml.text("accidental", &attributes, accidental.name);
+        }
         time_modification(xml, event);
-        if let Some(staff) = voice.staff {
+        if let Some(stem) = event.stem {
+            xml.text("stem", &[], stem);
+        }
+        if let Some(staff) = voice.staff_of(event) {
             xml.text("staff", &[], &staff.to_string());
         }
         if !chord {
@@ -171,12 +200,18 @@ fn marked(articulations: Articulations, table: &[(u16, &'static str)]) -> Vec<&'
 fn notations(xml: &mut Xml, event: &Event, head: Head, chord: bool) {
     let ties = ties(head);
     let whole = (!chord).then_some(event);
-    let articulations = whole.map_or_else(Vec::new, |e| marked(e.articulations, &ARTICULATIONS));
+    let articulations = whole.map_or_else(Vec::new, |e| {
+        let mut names = marked(e.articulations, &ARTICULATIONS);
+        names.extend(&e.marks);
+        names
+    });
+    let accidental_marks = whole.map_or(&[][..], |e| &e.accidental_marks);
     let technical = whole.map_or_else(Vec::new, |e| marked(e.articulations, &TECHNICAL));
     let fermatas = whole.map_or_else(Vec::new, |e| marked(e.articulations, &FERMATAS));
     let ornaments = whole.map_or(&[][..], |e| &e.ornaments);
     let tremolo = whole.map_or(0, |e| e.tremolo);
     let slurs = whole.map_or(&[][..], |e| &e.slurs);
+    let glissandi = whole.map_or(&[][..], |e| &e.glissandi);
     let tuplets = whole.map_or(&[][..], |e| &e.tuplets);
     let marks_tuplet = tuplets.iter().any(|t| t.start || t.stop);
     if ties.is_empty()
@@ -186,6 +221,9 @@ fn notations(xml: &mut Xml, event: &Event, head: Head, chord: bool) {
         && ornaments.is_empty()
         && tremolo == 0
         && slurs.is_empty()
+        && glissandi.is_empty()
+        && accidental_marks.is_empty()
+        && event.arpeggio.is_none()
         && !marks_tuplet
     {
         return;
@@ -214,6 +252,18 @@ fn notations(xml: &mut Xml, event: &Event, head: Head, chord: bool) {
             .into_iter()
             .rev()
             .for_each(|(_, level)| xml.empty("tuplet", &[("type", "stop"), ("number", &level.to_string())]));
+        glissandi.iter().for_each(|glissando| {
+            let attributes = [
+                ("type", if glissando.start { "start" } else { "stop" }),
+                ("number", &glissando.number.to_string()),
+                ("line-type", glissando.line_type),
+            ];
+            xml.text("glissando", &attributes, glissando.text.as_deref().unwrap_or_default());
+        });
+        if let Some(direction) = event.arpeggio {
+            let attributes: Vec<(&str, &str)> = direction.map(|d| ("direction", d)).into_iter().collect();
+            xml.empty("arpeggiate", &attributes);
+        }
         group(xml, "articulations", &articulations);
         group(xml, "technical", &technical);
         if !ornaments.is_empty() || tremolo > 0 {
@@ -227,6 +277,9 @@ fn notations(xml: &mut Xml, event: &Event, head: Head, chord: bool) {
         fermatas
             .iter()
             .for_each(|&shape| xml.text("fermata", &[("type", "upright")], shape));
+        accidental_marks
+            .iter()
+            .for_each(|&mark| xml.text("accidental-mark", &[("placement", "above")], mark));
     });
 }
 

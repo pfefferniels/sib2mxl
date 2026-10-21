@@ -4,9 +4,13 @@
 //! clef, key and instrument, and bar `n` is measure `n`. Objects at position
 //! 0xffff sit at the start of their bar, objects at 0x7f00 at its end.
 
+mod accidentals;
+mod chord;
+mod figures;
 mod link;
 mod parts;
 mod staff;
+mod stems;
 mod styles;
 mod system;
 
@@ -14,7 +18,7 @@ use libsib::tree::Node;
 
 use crate::error::{Error, Result};
 use crate::fields::Fields;
-use crate::model::{Measure, Score, Ticks, Work};
+use crate::model::{Credit, Key, Measure, Score, Ticks, Work};
 use crate::text;
 use styles::Styles;
 
@@ -27,8 +31,11 @@ mod tag {
     pub const BARLINE: i64 = 0x08;
     pub const TIME_SIGNATURE: i64 = 0x09;
     pub const KEY_SIGNATURE: i64 = 0x0a;
+    pub const LINE: i64 = 0x0c;
+    pub const ARPEGGIO: i64 = 0x0d;
     pub const CRESCENDO: i64 = 0x0e;
     pub const DIMINUENDO: i64 = 0x0f;
+    pub const GLISSANDO: i64 = 0x10;
     pub const OCTAVA: i64 = 0x11;
     pub const PEDAL: i64 = 0x12;
     pub const ENDING: i64 = 0x13;
@@ -40,6 +47,7 @@ mod tag {
     pub const SYMBOL: i64 = 0x1f;
     pub const SYSTEM_TEXT: i64 = 0x21;
     pub const TEXT: i64 = 0x22;
+    pub const GUITAR_FRAME: i64 = 0x24;
     pub const REHEARSAL_MARK: i64 = 0x26;
     pub const INSTRUMENT_CHANGE: i64 = 0x27;
     pub const BAR_REST: i64 = 0x28;
@@ -67,6 +75,8 @@ pub fn score(root: &Node) -> Result<Score> {
     let (parts, groups) = parts::assemble(music, &staves, staffs, &styles);
     Ok(Score {
         work: work(system, &summary, &styles),
+        layout: styles.layout,
+        credits: credits(system, &summary, &styles),
         measures,
         parts,
         groups,
@@ -107,6 +117,55 @@ fn work(system: &Node, summary: &Summary, styles: &Styles) -> Work {
         lyricist: page_text("lyricist").or_else(|| summary.get("Lyricist")),
         arranger: summary.get("Arranger"),
         rights: page_text("copyright").or_else(|| summary.get("Copyright")),
+    }
+}
+
+/// Page-aligned text of the first page, in the order Sibelius lists it.
+fn credits(system: &Node, summary: &Summary, styles: &Styles) -> Vec<Credit> {
+    const KINDS: [(&str, &str); 7] = [
+        ("title", "title"),
+        ("subtitle", "subtitle"),
+        ("composer", "composer"),
+        ("lyricist", "lyricist"),
+        ("arranger", "arranger"),
+        ("copyright", "rights"),
+        ("dedication", "dedication"),
+    ];
+    let first_bars = system.children("Bars").into_iter().take(2);
+    first_bars
+        .flat_map(|bar| bar.children("Items"))
+        .filter(|item| item.number("tag") == Some(tag::SYSTEM_TEXT) && !item.flag("HideInScore"))
+        .filter_map(|item| {
+            let style = text_style(item, styles)?;
+            let role = style.strip_prefix("text.system.page_aligned.")?;
+            let (_, kind) = KINDS.iter().find(|(name, _)| role.split('.').next() == Some(*name))?;
+            let text = summary.plain(&item.child("StyledString")?.string("Text")?);
+            let text = text.trim();
+            (!text.is_empty()).then(|| Credit {
+                kind,
+                text: text.to_string(),
+                font: styles.text_font(&style),
+            })
+        })
+        .collect()
+}
+
+fn key(item: &Node) -> Key {
+    Key {
+        fifths: item.number("Sharps").unwrap_or(0) as i8,
+        major: item.number("Major").is_none_or(|major| major != 0),
+    }
+}
+
+/// The measure a key signature changes: one in bar 0 holds for measure 1;
+/// elsewhere one at the start of a bar changes it, and one at its end (or
+/// within it) the next.
+fn key_measure(bar: usize, item: &Node) -> usize {
+    let sr = item.number("Sr").unwrap_or(0) as Ticks;
+    match bar {
+        0 => 0,
+        _ if sr == 0 || sr == BAR_START => bar - 1,
+        _ => bar,
     }
 }
 

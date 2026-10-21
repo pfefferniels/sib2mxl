@@ -6,14 +6,30 @@
 use libsib::tree::Node;
 
 use crate::fields::Fields;
-use crate::model::{Instrument, Interval};
+use crate::model::{Font, Instrument, Interval, Layout};
 
 pub struct Styles {
+    pub layout: Layout,
     text: Vec<String>,
+    text_fonts: Vec<Font>,
     line: Vec<String>,
-    line_text: Vec<Option<String>>,
+    lines: Vec<LineStyle>,
     clef: Vec<String>,
     instruments: Vec<InstrumentType>,
+    /// The open strings of each tablature stave type, lowest first, in quarter tones.
+    tunings: Vec<(String, Vec<i64>)>,
+}
+
+/// How a line style draws a line, and its caption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineStyle {
+    pub text: Option<String>,
+    /// `solid`, `dashed`, `dotted` or `wavy`.
+    pub line_type: &'static str,
+    /// How each end looks: `none`, `up` or `down` (a hook), or `arrow`.
+    pub start: &'static str,
+    pub end: &'static str,
+    pub vertical: bool,
 }
 
 pub struct InstrumentType {
@@ -41,21 +57,40 @@ impl Styles {
                 })
                 .collect()
         };
+        let layout = layout(music);
         Self {
+            layout,
             text: ids("TextStyles", old_text_id),
-            line: ids("LineStyles", old_line_id),
-            line_text: music
-                .children("LineStyles")
+            text_fonts: music
+                .children("TextStyles")
                 .into_iter()
-                .map(|style| style.nested_string("Text"))
+                .map(|style| font(style, &layout))
                 .collect(),
+            line: ids("LineStyles", old_line_id),
+            lines: music.children("LineStyles").into_iter().map(line_style).collect(),
             clef: ids("ClefStyles", old_clef_id),
             instruments: music
                 .children("InstrumentList")
                 .into_iter()
                 .filter_map(|instrument| instrument_type(music, instrument))
                 .collect(),
+            tunings: music
+                .children("StaveTypes")
+                .into_iter()
+                .filter_map(|stave_type| {
+                    let pitches = stave_type.numbers("Pitches");
+                    Some((stave_type.style("Id")?, pitches)).filter(|(_, pitches)| !pitches.is_empty())
+                })
+                .collect(),
         }
+    }
+
+    /// The open strings of a tablature stave type, lowest first.
+    pub fn tuning(&self, stave_type: &str) -> Option<&[i64]> {
+        self.tunings
+            .iter()
+            .find(|(id, _)| id == stave_type)
+            .map(|(_, pitches)| pitches.as_slice())
     }
 
     /// The type of the instrument that an instrument change switches to.
@@ -69,18 +104,125 @@ impl Styles {
         resolve(styled, "TextStyle", &self.text)
     }
 
+    /// The font a text style sets its text in.
+    pub fn text_font(&self, id: &str) -> Font {
+        self.text
+            .iter()
+            .position(|text| text == id)
+            .and_then(|index| self.text_fonts.get(index))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn line(&self, item: &Node) -> Option<String> {
         resolve(item, "LineStyle", &self.line)
     }
 
-    pub fn clef(&self, item: &Node) -> Option<String> {
-        resolve(item, "ClefStyle", &self.clef)
+    /// The clef style of a clef, as shown at concert pitch or transposed.
+    pub fn clef(&self, item: &Node, transposed: bool) -> Option<String> {
+        transposed
+            .then(|| resolve(item, "TransposingClefStyle", &self.clef))
+            .flatten()
+            .or_else(|| resolve(item, "ClefStyle", &self.clef))
     }
 
-    /// The text a line style draws, such as `rit.`.
-    pub fn line_text(&self, id: &str) -> Option<&str> {
-        let index = self.line.iter().position(|line| line == id)?;
-        self.line_text.get(index)?.as_deref()
+    /// A line style as the file defines it, or as its id describes the
+    /// built-in styles, which files leave out unless they use them.
+    pub fn line_style(&self, id: &str) -> LineStyle {
+        self.line
+            .iter()
+            .position(|line| line == id)
+            .and_then(|index| self.lines.get(index))
+            .cloned()
+            .unwrap_or_else(|| built_in_line_style(id))
+    }
+}
+
+/// The document's page and staff size, as Layout > Document Setup sets them.
+fn layout(music: &Node) -> Layout {
+    let setup = music
+        .child("Options")
+        .and_then(|options| options.child("PageAndStaveMargins"));
+    let millimetres = |name: &str, default: f64| {
+        setup
+            .and_then(|setup| setup.float(name))
+            .filter(|&mm| mm > 0.0)
+            .unwrap_or(default)
+    };
+    let default = Layout::default();
+    Layout {
+        staff_height: millimetres("StaveHeightmm", default.staff_height),
+        page_width: millimetres("PageWidthmm", default.page_width),
+        page_height: millimetres("PageHeightmm", default.page_height),
+        left: millimetres("PageLeftMarginmm", default.left),
+        right: millimetres("PageRightMarginmm", default.right),
+        top: millimetres("PageTopMarginmm", default.top),
+        bottom: millimetres("PageBottomMarginmm", default.bottom),
+    }
+}
+
+/// A text style's font. Its height counts 32nds of a staff space.
+fn font(style: &Node, layout: &Layout) -> Font {
+    Font {
+        family: style.string("FontName").filter(|name| !name.is_empty()),
+        size: style
+            .number("Height")
+            .filter(|&height| height > 0)
+            .map(|height| layout.points(height as f64)),
+        bold: style.flag("Bold"),
+        italic: style.flag("Italic"),
+        underline: style.flag("Underline"),
+    }
+}
+
+fn line_style(style: &Node) -> LineStyle {
+    let end = |notch: &str, arrow: &str| match (style.number(arrow), style.signed(notch)) {
+        (Some(arrow), _) if arrow != 0 => "arrow",
+        (_, Some(dy)) if dy < 0 => "down",
+        (_, Some(dy)) if dy > 0 => "up",
+        _ => "none",
+    };
+    LineStyle {
+        text: style
+            .flag("CaptionEnabled")
+            .then(|| style.child("CaptionRef")?.string("Text"))
+            .flatten()
+            .or_else(|| style.nested_string("Text")),
+        line_type: match style.number("LineType") {
+            Some(2) => "dotted",
+            Some(3) => "dashed",
+            _ => "solid",
+        },
+        start: end("StartCapNotchDy", "ArrowType"),
+        end: end("EndCapNotchDy", "EndCapArrowType"),
+        vertical: style.flag("Vertical"),
+    }
+}
+
+fn built_in_line_style(id: &str) -> LineStyle {
+    let hook = match () {
+        _ if id.contains("bracket.above") => "down",
+        _ if id.contains("bracket.below") => "up",
+        _ => "none",
+    };
+    let (start, end) = match () {
+        _ if id.contains("arrow") && id.contains("right.left") => ("arrow", "arrow"),
+        _ if id.contains("arrow") => ("none", "arrow"),
+        _ if id.ends_with(".start") => (hook, "none"),
+        _ if id.ends_with(".end") => ("none", hook),
+        _ => (hook, hook),
+    };
+    LineStyle {
+        text: None,
+        line_type: match () {
+            _ if id.contains("dashed") => "dashed",
+            _ if id.contains("dotted") => "dotted",
+            _ if id.contains("vibrato") || id.contains("wavy") => "wavy",
+            _ => "solid",
+        },
+        start,
+        end,
+        vertical: id.contains("vertical"),
     }
 }
 

@@ -7,7 +7,7 @@ use super::Clock;
 use super::direction;
 use super::note::{self, Voice};
 use crate::model::{
-    Barline, Clef, Direction, Event, Figures, Instrument, Interval, Key, Part, Repeat, Score, Staff, StaffMeasure,
+    Barline, Clef, Direction, Event, Figures, Harmony, Instrument, Interval, Key, Part, Repeat, Score, StaffMeasure,
     Ticks,
 };
 use crate::xml::Xml;
@@ -15,7 +15,8 @@ use crate::xml::Xml;
 /// Positions inside tuplets are rounded to whole ticks.
 const SLACK: Ticks = 2;
 
-pub fn write(xml: &mut Xml, score: &Score, part: usize, index: usize, clock: &Clock) {
+/// Writes one measure of a part; `keys` holds each staff's written key per measure.
+pub fn write(xml: &mut Xml, score: &Score, part: usize, index: usize, clock: &Clock, keys: &[Vec<Key>]) {
     let measure = &score.measures[index];
     let first = usize::from(!score.measures.first().is_some_and(|m| m.pickup));
     let number = (index + first).to_string();
@@ -24,8 +25,13 @@ pub fn write(xml: &mut Xml, score: &Score, part: usize, index: usize, clock: &Cl
         attributes.push(("implicit", "yes"));
     }
     xml.element("measure", &attributes, |xml| {
+        if measure.new_page {
+            xml.empty("print", &[("new-page", "yes")]);
+        } else if measure.new_system {
+            xml.empty("print", &[("new-system", "yes")]);
+        }
         barline(xml, "left", &measure.left);
-        self::attributes(xml, score, &score.parts[part], index, clock);
+        self::attributes(xml, score, &score.parts[part], index, clock, keys);
         voices(xml, score, part, index, clock);
         barline(xml, "right", &measure.right);
     });
@@ -58,7 +64,7 @@ fn barline(xml: &mut Xml, location: &str, barline: &Barline) {
 
 /// Divisions and staves in the first measure; key, time, clefs and
 /// transpositions where they change.
-fn attributes(xml: &mut Xml, score: &Score, part: &Part, index: usize, clock: &Clock) {
+fn attributes(xml: &mut Xml, score: &Score, part: &Part, index: usize, clock: &Clock, keys: &[Vec<Key>]) {
     let measure = &score.measures[index];
     let staves = part.staves.len();
     let clefs: Vec<(usize, &Clef)> = part
@@ -78,33 +84,29 @@ fn attributes(xml: &mut Xml, score: &Score, part: &Part, index: usize, clock: &C
         .iter()
         .enumerate()
         .filter_map(|(staff, content)| {
-            let (_, instrument) = content.instruments.iter().find(|(from, _)| *from == index)?;
-            Some((staff, *instrument))
+            let switch = content.instruments.iter().find(|s| s.measure == index && s.at == 0)?;
+            Some((staff, switch.instrument))
         })
         .collect();
     let first = index == 0;
-    if !first && measure.key.is_none() && measure.time.is_none() && clefs.is_empty() && changes.is_empty() {
+    let current: Vec<Key> = keys.iter().map(|staff| staff[index]).collect();
+    let key_changes = first || measure.key.is_some() || keys.iter().any(|staff| staff[index] != staff[index - 1]);
+    if !key_changes && measure.time.is_none() && clefs.is_empty() && changes.is_empty() {
         return;
     }
-    let instrument = part
-        .staves
-        .first()
-        .map_or_else(Instrument::default, |staff| instrument_at(staff, index));
-    let key = measure.key.or_else(|| {
-        let keys = score.measures[..=index].iter().rev().find_map(|m| m.key);
-        let transposed = instrument != Instrument::default();
-        keys.or(transposed.then_some(Key { fifths: 0, major: true }))
-            .filter(|_| first || changes.iter().any(|&(staff, _)| staff == 0))
-    });
     xml.element("attributes", &[], |xml| {
         if first {
             xml.text("divisions", &[], &clock.divisions().to_string());
         }
-        if let Some(key) = key.map(|key| written_key(key, instrument)) {
-            xml.element("key", &[], |xml| {
-                xml.text("fifths", &[], &key.fifths.to_string());
-                xml.text("mode", &[], if key.major { "major" } else { "minor" });
-            });
+        if key_changes {
+            let same = current.windows(2).all(|pair| pair[0] == pair[1]);
+            match same {
+                true => current.first().iter().for_each(|&&key| self::key(xml, key, None)),
+                false => current
+                    .iter()
+                    .enumerate()
+                    .for_each(|(staff, &key)| self::key(xml, key, Some(staff + 1))),
+            }
         }
         if let Some(time) = &measure.time {
             let symbol: Vec<(&str, &str)> = time.symbol.map(|symbol| ("symbol", symbol)).into_iter().collect();
@@ -128,32 +130,6 @@ fn attributes(xml: &mut Xml, score: &Score, part: &Part, index: usize, clock: &C
     });
 }
 
-fn instrument_at(staff: &Staff, measure: usize) -> Instrument {
-    staff
-        .instruments
-        .iter()
-        .rev()
-        .find(|(from, _)| *from <= measure)
-        .map_or_else(Instrument::default, |&(_, instrument)| instrument)
-}
-
-/// The key as written for an instrument: transposed, enharmonically within
-/// seven sharps or flats, or none for instruments written without key signatures.
-fn written_key(concert: Key, instrument: Instrument) -> Key {
-    if !instrument.key_signature {
-        return Key { fifths: 0, major: true };
-    }
-    let fifths = match i32::from(concert.fifths) + instrument.transposition.key_shift() {
-        sharps if sharps > 7 => sharps - 12,
-        flats if flats < -7 => flats + 12,
-        fifths => fifths,
-    };
-    Key {
-        fifths: fifths as i8,
-        ..concert
-    }
-}
-
 /// The interval from written to sounding pitch, in whole octaves and the rest.
 fn transpose(xml: &mut Xml, interval: Interval, staff: Option<usize>) {
     let semitones = interval.chrom2 / 2;
@@ -166,6 +142,15 @@ fn transpose(xml: &mut Xml, interval: Interval, staff: Option<usize>) {
         if octaves != 0 {
             xml.text("octave-change", &[], &octaves.to_string());
         }
+    });
+}
+
+fn key(xml: &mut Xml, key: Key, staff: Option<usize>) {
+    let number = staff.map(|staff| staff.to_string());
+    let attributes: Vec<(&str, &str)> = number.iter().map(|n| ("number", n.as_str())).collect();
+    xml.element("key", &attributes, |xml| {
+        xml.text("fifths", &[], &key.fifths.to_string());
+        xml.text("mode", &[], if key.major { "major" } else { "minor" });
     });
 }
 
@@ -200,6 +185,9 @@ enum Item<'a> {
 #[derive(Clone, Copy)]
 enum Mark<'a> {
     Clef(&'a Clef),
+    /// An instrument change within the measure.
+    Transpose(Interval),
+    Harmony(&'a Harmony),
     Direction(&'a Direction),
     Figures(&'a Figures),
 }
@@ -208,10 +196,11 @@ impl Item<'_> {
     /// Items at the same position go in this order.
     fn rank(self) -> u8 {
         match self {
-            Item::Mark(Mark::Clef(_)) => 0,
-            Item::Mark(Mark::Direction(_)) => 1,
-            Item::Mark(Mark::Figures(_)) => 2,
-            Item::Event(_) => 3,
+            Item::Mark(Mark::Clef(_) | Mark::Transpose(_)) => 0,
+            Item::Mark(Mark::Harmony(_)) => 1,
+            Item::Mark(Mark::Direction(_)) => 2,
+            Item::Mark(Mark::Figures(_)) => 3,
+            Item::Event(_) => 4,
         }
     }
 }
@@ -231,8 +220,15 @@ fn voices(xml: &mut Xml, score: &Score, part: usize, index: usize, clock: &Clock
             let voice = |voice: u8| Voice {
                 number: staff as u8 * 4 + voice,
                 staff: (staves.len() > 1).then_some(staff + 1),
+                staves: staves.len(),
             };
-            streams(&content.measures[index], system, voice, content.percussion)
+            let switches: Vec<(Ticks, Interval)> = content
+                .instruments
+                .iter()
+                .filter(|switch| switch.measure == index && switch.at > 0)
+                .map(|switch| (switch.at, switch.instrument.transposition))
+                .collect();
+            streams(&content.measures[index], system, &switches, voice, content.percussion)
         })
         .collect();
     let measure_length = score.measures[index].length;
@@ -257,6 +253,7 @@ fn voices(xml: &mut Xml, score: &Score, part: usize, index: usize, clock: &Clock
 fn streams<'a>(
     content: &'a StaffMeasure,
     system: &'a [Direction],
+    switches: &[(Ticks, Interval)],
     voice: impl Fn(u8) -> Voice,
     percussion: bool,
 ) -> Vec<Stream<'a>> {
@@ -275,11 +272,20 @@ fn streams<'a>(
         .iter()
         .filter(|(at, _)| *at > 0)
         .map(|(at, clef)| (1, *at, Item::Mark(Mark::Clef(clef))));
+    let harmonies = content
+        .harmonies
+        .iter()
+        .map(|h| (1, h.at, Item::Mark(Mark::Harmony(h))));
+    let transpositions = switches
+        .iter()
+        .map(|&(at, interval)| (1, at, Item::Mark(Mark::Transpose(interval))));
     let mut by_voice: BTreeMap<u8, Vec<(Ticks, Item)>> = BTreeMap::new();
     events
+        .chain(transpositions)
         .chain(directions)
         .chain(figures)
         .chain(clefs)
+        .chain(harmonies)
         .for_each(|(v, at, item)| by_voice.entry(v).or_default().push((at, item)));
     by_voice
         .into_iter()
@@ -338,6 +344,8 @@ fn move_to(xml: &mut Xml, now: u64, target: u64, slack: u64, voice: &Voice) -> u
 fn write_mark(xml: &mut Xml, mark: Mark, voice: &Voice) {
     match mark {
         Mark::Clef(clef) => xml.element("attributes", &[], |xml| self::clef(xml, clef, voice.staff)),
+        Mark::Transpose(interval) => xml.element("attributes", &[], |xml| transpose(xml, interval, voice.staff)),
+        Mark::Harmony(harmony) => direction::harmony(xml, harmony, voice),
         Mark::Direction(d) => direction::direction(xml, d, voice),
         Mark::Figures(figures) => direction::figured_bass(xml, figures),
     }

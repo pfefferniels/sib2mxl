@@ -3,9 +3,9 @@
 
 use libsib::tree::Node;
 
-use super::{BAR_END, BAR_START, Styles, Summary, Timeline, position, tag, text_style};
+use super::{BAR_END, BAR_START, Styles, Summary, Timeline, key, key_measure, position, tag, text_style};
 use crate::fields::Fields;
-use crate::model::{Direction, DirectionKind, Ending, Key, Measure, QUARTER, Repeat, Ticks, Time};
+use crate::model::{Direction, DirectionKind, Ending, Measure, QUARTER, Repeat, Ticks, Time};
 use crate::text;
 
 pub fn measures(music: &Node, system: &Node, summary: &Summary, styles: &Styles) -> Vec<Measure> {
@@ -24,6 +24,7 @@ pub fn measures(music: &Node, system: &Node, summary: &Summary, styles: &Styles)
         .iter()
         .filter(|(bar, item)| *bar > 0 && item.number("tag") == Some(tag::BARLINE))
         .for_each(|&(bar, item)| place_barline(&mut measures[bar - 1], item));
+    place_breaks(music, &mut measures);
     let timeline = Timeline::new(&measures);
     objects
         .iter()
@@ -82,8 +83,7 @@ fn items(bar: &Node, tag: i64) -> impl Iterator<Item = &Node> {
 /// marked as a bar end before the barline.
 fn spaced_lengths(music: &Node) -> Vec<Option<Ticks>> {
     const BAR_END_SPACING: i64 = 0x8000;
-    let spacings = music.children("BarSpacings");
-    let length = |spacing: &Node| {
+    by_bar(music, |spacing| {
         spacing
             .child("Spacings")?
             .children("items")
@@ -93,14 +93,32 @@ fn spaced_lengths(music: &Node) -> Vec<Option<Ticks>> {
             .filter(|&sr| sr < i64::from(BAR_END))
             .max()
             .map(|sr| sr as Ticks)
-    };
-    let mut lengths = vec![None; spacings.len()];
+    })
+}
+
+/// A bar's entry in the spacing table, which lists bars by number.
+fn by_bar<T: Clone>(music: &Node, value: impl Fn(&Node) -> Option<T>) -> Vec<Option<T>> {
+    let spacings = music.children("BarSpacings");
+    let mut values = vec![None; spacings.len()];
     spacings.iter().for_each(|spacing| {
-        if let Some(slot) = spacing.number("BarNum").and_then(|n| lengths.get_mut(n as usize)) {
-            *slot = length(spacing);
+        if let Some(slot) = spacing.number("BarNum").and_then(|n| values.get_mut(n as usize)) {
+            *slot = value(spacing);
         }
     });
-    lengths
+    values
+}
+
+/// Where a bar lets the music break: a bit set of within a system (1), at
+/// the end of a system (2) and at the end of a page (4). A bar that allows
+/// only the end of a system or page forces that break after it.
+fn place_breaks(music: &Node, measures: &mut [Measure]) {
+    const SYSTEM: i64 = 2;
+    const PAGE: i64 = 4;
+    let breaks = by_bar(music, |spacing| spacing.number("BreakType"));
+    measures.iter_mut().zip(breaks).for_each(|(measure, allowed)| {
+        measure.new_page = allowed == Some(PAGE);
+        measure.new_system = allowed == Some(SYSTEM) || allowed == Some(SYSTEM | PAGE);
+    });
 }
 
 fn time(item: &Node) -> Time {
@@ -126,21 +144,9 @@ fn time(item: &Node) -> Time {
     }
 }
 
-/// A key signature in bar 0 holds for measure 1; elsewhere one at the start
-/// of a bar changes it, and one at its end (or within it) changes the next.
 fn place_key(measures: &mut [Measure], bar: usize, item: &Node) {
-    let sr = item.number("Sr").unwrap_or(0) as Ticks;
-    let measure = match bar {
-        0 => 0,
-        _ if sr == 0 || sr == BAR_START => bar - 1,
-        _ => bar,
-    };
-    let key = Key {
-        fifths: item.number("Sharps").unwrap_or(0) as i8,
-        major: item.number("Major").is_none_or(|major| major != 0),
-    };
-    if let Some(measure) = measures.get_mut(measure) {
-        measure.key = Some(key);
+    if let Some(measure) = measures.get_mut(key_measure(bar, item)) {
+        measure.key = Some(key(item));
     }
 }
 
@@ -243,9 +249,10 @@ fn directions(
     let tempo_lines = in_measures()
         .filter(|(_, item)| item.number("tag") == Some(tag::RITARDANDO))
         .filter_map(|&(bar, item)| {
-            let text = styles.line_text(&styles.line(item)?)?;
-            let words = text::plain(&text::runs(text, |_| None)).trim().to_string();
-            (!words.is_empty()).then(|| direction(bar, item, vec![DirectionKind::Words(words)], None))
+            let text = styles.line_style(&styles.line(item)?).text?;
+            let words = text::plain(&text::runs(&text, |_| None));
+            let font = styles.text_font("text.system.tempo");
+            (!words.trim().is_empty()).then(|| direction(bar, item, vec![text::plain_words(&words, &font)], None))
         });
     texts.chain(rehearsal_marks).chain(tempo_lines).collect()
 }
@@ -258,12 +265,13 @@ fn system_text(item: &Node, summary: &Summary, styles: &Styles) -> Option<(Vec<D
         return None;
     }
     let runs = text::runs(&raw, |name| summary.get(name));
+    let font = styles.text_font(&style);
     let (kinds, tempo) = match ["tempo", "metronome", "metricmodulation"]
         .iter()
         .any(|s| style.contains(s))
     {
-        true => text::tempo(&runs),
-        false => (text::words(&runs).into_iter().collect(), None),
+        true => text::tempo(&runs, &font, &styles.layout),
+        false => (text::words(&runs, &font, &styles.layout).into_iter().collect(), None),
     };
     (!kinds.is_empty()).then_some((kinds, tempo))
 }

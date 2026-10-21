@@ -4,7 +4,7 @@ mod direction;
 mod measure;
 mod note;
 
-use crate::model::{Content, Event, QUARTER, Score, Ticks};
+use crate::model::{Content, Credit, Event, Font, Key, Layout, QUARTER, Score, Ticks};
 use crate::xml::Xml;
 
 const DOCTYPE: &str = r#"<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">"#;
@@ -14,10 +14,17 @@ pub fn musicxml(score: &Score) -> String {
     let mut xml = Xml::new(DOCTYPE);
     xml.element("score-partwise", &[("version", "4.0")], |xml| {
         work(xml, score);
+        defaults(xml, &score.layout);
+        credits(xml, score);
         part_list(xml, score);
         score.parts.iter().enumerate().for_each(|(part, _)| {
+            let keys: Vec<Vec<Key>> = score.parts[part]
+                .staves
+                .iter()
+                .map(|staff| staff.written_keys(&score.measures))
+                .collect();
             xml.element("part", &[("id", &part_id(part))], |xml| {
-                (0..score.measures.len()).for_each(|measure| measure::write(xml, score, part, measure, &clock));
+                (0..score.measures.len()).for_each(|measure| measure::write(xml, score, part, measure, &clock, &keys));
             })
         });
     });
@@ -47,11 +54,102 @@ fn work(xml: &mut Xml, score: &Score) {
         }
         xml.element("encoding", &[], |xml| {
             xml.text("software", &[], concat!("sib2mxl ", env!("CARGO_PKG_VERSION")));
-            [("accidental", "no"), ("beam", "yes"), ("stem", "no")]
+            [("accidental", "yes"), ("beam", "yes"), ("stem", "no")]
                 .into_iter()
                 .for_each(|(element, supported)| xml.empty("supports", &[("element", element), ("type", supported)]));
         });
     });
+}
+
+fn tenths(value: f64) -> String {
+    format!("{}", (value * 100.0).round() / 100.0)
+}
+
+fn defaults(xml: &mut Xml, layout: &Layout) {
+    xml.element("defaults", &[], |xml| {
+        xml.element("scaling", &[], |xml| {
+            xml.text("millimeters", &[], &tenths(layout.staff_height));
+            xml.text("tenths", &[], "40");
+        });
+        xml.element("page-layout", &[], |xml| {
+            xml.text("page-height", &[], &tenths(layout.tenths(layout.page_height)));
+            xml.text("page-width", &[], &tenths(layout.tenths(layout.page_width)));
+            xml.element("page-margins", &[("type", "both")], |xml| {
+                [
+                    ("left-margin", layout.left),
+                    ("right-margin", layout.right),
+                    ("top-margin", layout.top),
+                    ("bottom-margin", layout.bottom),
+                ]
+                .into_iter()
+                .for_each(|(name, mm)| xml.text(name, &[], &tenths(layout.tenths(mm))));
+            });
+        });
+    });
+}
+
+/// Credits on the first page: the dedication, title and subtitle centred
+/// from the top margin down, the composer and arranger to the right and the
+/// lyricist to the left below them, and the copyright at the bottom.
+fn credits(xml: &mut Xml, score: &Score) {
+    let layout = &score.layout;
+    let height = |credit: &Credit| layout.tenths(credit.font.size.unwrap_or(12.0) * 25.4 / 72.0) * 1.3;
+    let centred: Vec<&Credit> = ["dedication", "title", "subtitle"]
+        .iter()
+        .flat_map(|kind| score.credits.iter().filter(move |c| c.kind == *kind))
+        .collect();
+    let top = layout.tenths(layout.page_height - layout.top);
+    let tops: Vec<f64> = centred
+        .iter()
+        .scan(top, |y, credit| {
+            let at = *y;
+            *y -= height(credit);
+            Some(at)
+        })
+        .collect();
+    let below = top - centred.iter().map(|c| height(c)).sum::<f64>();
+    let width = layout.tenths(layout.page_width);
+    let placed = centred
+        .iter()
+        .zip(tops)
+        .map(|(credit, y)| (*credit, width / 2.0, y, "center", "top"))
+        .chain(score.credits.iter().filter_map(|credit| match credit.kind {
+            "composer" | "arranger" => Some((credit, width - layout.tenths(layout.right), below, "right", "top")),
+            "lyricist" => Some((credit, layout.tenths(layout.left), below, "left", "top")),
+            "rights" => Some((credit, width / 2.0, layout.tenths(layout.bottom), "center", "bottom")),
+            _ => None,
+        }));
+    placed.for_each(|(credit, x, y, justify, valign)| {
+        xml.element("credit", &[("page", "1")], |xml| {
+            if credit.kind != "dedication" {
+                xml.text("credit-type", &[], credit.kind);
+            }
+            let (x, y) = (tenths(x), tenths(y));
+            let mut attributes = vec![
+                ("default-x", x.as_str()),
+                ("default-y", y.as_str()),
+                ("justify", justify),
+                ("valign", valign),
+            ];
+            let font = font_attributes(&credit.font);
+            attributes.extend(font.iter().map(|(name, value)| (*name, value.as_str())));
+            xml.text("credit-words", &attributes, &credit.text);
+        });
+    });
+}
+
+/// MusicXML font attributes for the parts of a font that are set.
+pub fn font_attributes(font: &Font) -> Vec<(&'static str, String)> {
+    [
+        ("font-family", font.family.clone()),
+        ("font-size", font.size.map(|size| format!("{size}"))),
+        ("font-weight", font.bold.then(|| "bold".to_string())),
+        ("font-style", font.italic.then(|| "italic".to_string())),
+        ("underline", font.underline.then(|| "1".to_string())),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| Some((name, value?)))
+    .collect()
 }
 
 /// The parts, inside the brackets and braces that group them.
@@ -160,8 +258,7 @@ mod tests {
             content: Content::Chord(vec![Note {
                 pitch,
                 chrom2: 144,
-                tie_start: false,
-                tie_stop: false,
+                ..Note::default()
             }]),
             tuplets: vec![tuplet],
             ..Event::default()

@@ -10,6 +10,9 @@ pub const QUARTER: Ticks = 256;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Score {
     pub work: Work,
+    pub layout: Layout,
+    /// Text on the first page: title, composer and the like.
+    pub credits: Vec<Credit>,
     pub measures: Vec<Measure>,
     pub parts: Vec<Part>,
     pub groups: Vec<PartGroup>,
@@ -24,6 +27,74 @@ pub struct Work {
     pub rights: Option<String>,
 }
 
+/// Page and staff size, in millimetres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    pub staff_height: f64,
+    pub page_width: f64,
+    pub page_height: f64,
+    pub left: f64,
+    pub right: f64,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl Default for Layout {
+    /// A4 with a 7 mm staff, as Sibelius sets up a new score.
+    fn default() -> Self {
+        Self {
+            staff_height: 7.0,
+            page_width: 210.0,
+            page_height: 297.0,
+            left: 15.0,
+            right: 15.0,
+            top: 15.0,
+            bottom: 15.0,
+        }
+    }
+}
+
+impl Layout {
+    /// MusicXML tenths: ten to a staff space, forty to the staff height.
+    pub fn tenths(&self, millimetres: f64) -> f64 {
+        millimetres / self.staff_height * 40.0
+    }
+
+    /// Points for a text height in 32nds of a staff space, rounded to hundredths.
+    pub fn points(&self, height: f64) -> f64 {
+        const POINTS_PER_MILLIMETRE: f64 = 72.0 / 25.4;
+        let points = height / 32.0 * self.staff_height / 4.0 * POINTS_PER_MILLIMETRE;
+        (points * 100.0).round() / 100.0
+    }
+}
+
+/// Text on the first page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Credit {
+    /// A MusicXML credit type: `title`, `subtitle`, `composer`, `lyricist`, `rights`, …
+    pub kind: &'static str,
+    pub text: String,
+    pub font: Font,
+}
+
+/// How text is set. Unset fields follow the reader's defaults.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Font {
+    pub family: Option<String>,
+    /// In points.
+    pub size: Option<f64>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+/// A stretch of text in one font.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Run {
+    pub text: String,
+    pub font: Font,
+}
+
 /// What a bar holds for all staves.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Measure {
@@ -34,6 +105,9 @@ pub struct Measure {
     pub key: Option<Key>,
     pub left: Barline,
     pub right: Barline,
+    /// The measure starts a new system or a new page.
+    pub new_system: bool,
+    pub new_page: bool,
     /// Tempo, rehearsal marks and other text for the whole system, shown
     /// above the top staff.
     pub directions: Vec<Direction>,
@@ -79,6 +153,38 @@ pub struct Key {
     pub major: bool,
 }
 
+impl Key {
+    pub const C_MAJOR: Key = Key { fifths: 0, major: true };
+
+    /// The key as written for an instrument: transposed, enharmonically within
+    /// seven sharps or flats, or none for instruments written without key signatures.
+    pub fn written_for(self, instrument: Instrument) -> Key {
+        if !instrument.key_signature {
+            return Key::C_MAJOR;
+        }
+        let fifths = match i32::from(self.fifths) + instrument.transposition.key_shift() {
+            sharps if sharps > 7 => sharps - 12,
+            flats if flats < -7 => flats + 12,
+            fifths => fifths,
+        };
+        Key {
+            fifths: fifths as i8,
+            ..self
+        }
+    }
+
+    /// The alteration, in quarter tones, the key gives a step (0 is C).
+    pub fn alter2(self, step: u8) -> i8 {
+        const SHARPS: [u8; 7] = [3, 0, 4, 1, 5, 2, 6];
+        let count = usize::from(self.fifths.unsigned_abs()).min(7);
+        match self.fifths.signum() {
+            1 if SHARPS[..count].contains(&step) => 2,
+            -1 if SHARPS[7 - count..].contains(&step) => -2,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Part {
     pub name: String,
@@ -97,9 +203,48 @@ pub struct PartGroup {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Staff {
     pub percussion: bool,
-    /// The instrument from each measure where it changes, the first from measure 0.
-    pub instruments: Vec<(usize, Instrument)>,
+    /// The instrument from each change on, the first from the start.
+    pub instruments: Vec<Switch>,
     pub measures: Vec<StaffMeasure>,
+}
+
+impl Staff {
+    /// The instrument in force at a position.
+    pub fn instrument_at(&self, measure: usize, at: Ticks) -> Instrument {
+        self.instruments
+            .iter()
+            .rev()
+            .find(|switch| (switch.measure, switch.at) <= (measure, at))
+            .map_or_else(Instrument::default, |switch| switch.instrument)
+    }
+}
+
+impl Staff {
+    /// The key written on this staff in each measure: the score's key or the
+    /// staff's own, as written for the instrument in force.
+    pub fn written_keys(&self, measures: &[Measure]) -> Vec<Key> {
+        measures
+            .iter()
+            .enumerate()
+            .scan(Key::C_MAJOR, |concert, (index, measure)| {
+                let own = self
+                    .measures
+                    .get(index)
+                    .and_then(|m| m.keys.first())
+                    .map(|&(_, key)| key);
+                *concert = own.or(measure.key).unwrap_or(*concert);
+                Some(concert.written_for(self.instrument_at(index, 0)))
+            })
+            .collect()
+    }
+}
+
+/// A change of instrument on a staff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Switch {
+    pub measure: usize,
+    pub at: Ticks,
+    pub instrument: Instrument,
 }
 
 /// How an instrument's music is written.
@@ -139,6 +284,9 @@ pub struct StaffMeasure {
     pub clefs: Vec<(Ticks, Clef)>,
     pub directions: Vec<Direction>,
     pub figures: Vec<Figures>,
+    pub harmonies: Vec<Harmony>,
+    /// Key signatures of this staff alone, which differ from the other staves'.
+    pub keys: Vec<(Ticks, Key)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,16 +307,29 @@ pub struct Event {
     pub grace: Option<Grace>,
     pub cue: bool,
     pub hidden: bool,
+    /// Drawn on the staff above (-1) or below (1) its own.
+    pub cross_staff: i8,
+    /// The stem points the other way than it would by default.
+    pub flip_stem: bool,
+    /// `up` or `down`, where it differs from the default.
+    pub stem: Option<&'static str>,
     pub beam: BeamMode,
     /// Outermost first.
     pub tuplets: Vec<TupletLevel>,
     /// One entry per beam level, from the eighth-note beam inwards.
     pub beams: Vec<Beam>,
     pub articulations: Articulations,
+    /// Further MusicXML articulations, such as `breath-mark` or `caesura`.
+    pub marks: Vec<&'static str>,
+    /// Accidentals written above the note (editorial ones, for instance).
+    pub accidental_marks: Vec<&'static str>,
     pub tremolo: u8,
     /// MusicXML ornament names, such as `trill-mark` or `mordent`.
     pub ornaments: Vec<&'static str>,
     pub slurs: Vec<Slur>,
+    pub glissandi: Vec<Glissando>,
+    /// The chord is spread, upwards, downwards or (None) without a direction.
+    pub arpeggio: Option<Option<&'static str>>,
     pub lyrics: Vec<Lyric>,
 }
 
@@ -268,6 +429,15 @@ pub struct Slur {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Glissando {
+    pub number: u8,
+    pub start: bool,
+    /// `solid` or `wavy`.
+    pub line_type: &'static str,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lyric {
     pub verse: u8,
     pub syllabic: &'static str,
@@ -275,16 +445,38 @@ pub struct Lyric {
     pub extend: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Note {
     pub pitch: Pitch,
     /// Sounding pitch in quarter tones, which identifies the note a tie ends on.
     pub chrom2: u8,
     pub tie_start: bool,
     pub tie_stop: bool,
+    pub style: AccidentalStyle,
+    /// The accidental shown, if any.
+    pub accidental: Option<Accidental>,
+}
+
+/// How a note's accidental is shown, as set in Sibelius.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccidentalStyle {
+    /// Where the key and the bar require it.
+    #[default]
+    Normal,
+    Hidden,
+    Cautionary,
+    Bracketed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accidental {
+    /// A MusicXML accidental, such as `sharp` or `flat-flat`.
+    pub name: &'static str,
+    pub cautionary: bool,
+    pub parentheses: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pitch {
     /// 0 is C, 6 is B.
     pub step: u8,
@@ -305,7 +497,7 @@ pub struct Direction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DirectionKind {
-    Words(String),
+    Words(Vec<Run>),
     Dynamics(&'static str),
     Rehearsal(String),
     Metronome {
@@ -323,8 +515,66 @@ pub enum DirectionKind {
         kind: &'static str,
         line: bool,
     },
+    /// A general line over a stretch of music.
+    Bracket {
+        /// `start` or `stop`.
+        kind: &'static str,
+        number: u8,
+        line_end: &'static str,
+        line_type: &'static str,
+    },
     Segno,
     Coda,
+}
+
+/// A chord symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Harmony {
+    pub at: Ticks,
+    /// None for "no chord".
+    pub root: Option<Spelled>,
+    /// A MusicXML kind, such as `minor-seventh`.
+    pub kind: &'static str,
+    /// The suffix to show after the root.
+    pub text: String,
+    pub bass: Option<Spelled>,
+    pub degrees: Vec<Degree>,
+    /// The chord diagram shown with the symbol.
+    pub frame: Option<Frame>,
+}
+
+/// A chord diagram of a fretted instrument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub strings: u8,
+    pub frets: u8,
+    pub first_fret: u32,
+    pub notes: Vec<FrameNote>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameNote {
+    /// Numbered from the highest string, 1.
+    pub string: u8,
+    pub fret: u8,
+    /// `start` or `stop` of a barre.
+    pub barre: Option<&'static str>,
+}
+
+/// A note name: a diatonic step (0 is C) and its alteration in semitones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spelled {
+    pub step: u8,
+    pub alter: i8,
+}
+
+/// A chord tone added to, altered in or taken from a chord's kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Degree {
+    pub value: u8,
+    pub alter: i8,
+    /// `add`, `alter` or `subtract`.
+    pub kind: &'static str,
 }
 
 /// Figured bass under one position.
@@ -335,8 +585,11 @@ pub struct Figures {
     pub figures: Vec<Figure>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Figure {
     pub prefix: Option<&'static str>,
     pub number: Option<String>,
+    pub suffix: Option<&'static str>,
+    /// A line holding the figure before.
+    pub extend: bool,
 }

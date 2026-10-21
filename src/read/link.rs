@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use super::Timeline;
-use crate::model::{Beam, BeamMode, Content, Direction, DirectionKind, Event, Lyric, Slur, Staff, Ticks, TupletLevel};
+use super::styles::LineStyle;
+use crate::model::{
+    Beam, BeamMode, Content, Direction, DirectionKind, Event, Font, Glissando, Lyric, Slur, Staff, Ticks, TupletLevel,
+};
+use crate::text;
 
 /// An object of a stave that refers to events by position.
 pub struct Span {
@@ -38,6 +42,12 @@ pub enum SpanKind {
     Ornament(&'static str),
     /// Articulation bits added by a symbol.
     Articulation(u16),
+    Mark(&'static str),
+    AccidentalMark(&'static str),
+    Line(LineStyle),
+    Glissando(LineStyle),
+    /// `up`, `down` or no direction.
+    Arpeggio(Option<&'static str>),
     Lyric(Syllable),
 }
 
@@ -80,6 +90,7 @@ pub fn resolve(staff: &mut Staff, spans: &[Span], timeline: &Timeline) {
     staff.measures.iter_mut().for_each(|measure| beams(&mut measure.events));
     voices.values().for_each(|events| ties(staff, events));
     slurs(staff, spans, &voices, timeline);
+    glissandi(staff, spans, &voices, timeline);
     lines(staff, spans, timeline);
     marks(staff, spans);
     lyrics(staff, spans);
@@ -289,29 +300,64 @@ fn ties(staff: &mut Staff, voice: &[(Ticks, At)]) {
     });
 }
 
-/// Slurs from the event they start on to the last event they reach, numbered
-/// so that overlapping slurs differ.
+/// Slurs from the event they start on to the last event they reach.
 fn slurs(staff: &mut Staff, spans: &[Span], voices: &BTreeMap<u8, Vec<(Ticks, At)>>, timeline: &Timeline) {
-    let slurs: Vec<(At, At, Ticks, Ticks)> = spans
+    let is_slur = |kind: &SpanKind| matches!(kind, SpanKind::Slur);
+    connections(spans, is_slur, voices, timeline)
+        .into_iter()
+        .for_each(|(first, last, number, _)| {
+            event_mut(staff, first).slurs.push(Slur { number, start: true });
+            event_mut(staff, last).slurs.push(Slur { number, start: false });
+        });
+}
+
+/// Glissandi from the note they leave to the note they reach.
+fn glissandi(staff: &mut Staff, spans: &[Span], voices: &BTreeMap<u8, Vec<(Ticks, At)>>, timeline: &Timeline) {
+    let is_glissando = |kind: &SpanKind| matches!(kind, SpanKind::Glissando(_));
+    connections(spans, is_glissando, voices, timeline)
+        .into_iter()
+        .for_each(|(first, last, number, span)| {
+            let SpanKind::Glissando(style) = &span.kind else {
+                return;
+            };
+            let line_type = if style.line_type == "wavy" { "wavy" } else { "solid" };
+            let glissando = |start: bool| Glissando {
+                number,
+                start,
+                line_type,
+                text: start.then(|| style.text.clone()).flatten(),
+            };
+            event_mut(staff, first).glissandi.push(glissando(true));
+            event_mut(staff, last).glissandi.push(glissando(false));
+        });
+}
+
+/// The spans of one kind that join an event to a later one in their voice,
+/// with those events and numbers that differ between overlapping spans.
+fn connections<'a>(
+    spans: &'a [Span],
+    is: impl Fn(&SpanKind) -> bool,
+    voices: &BTreeMap<u8, Vec<(Ticks, At)>>,
+    timeline: &Timeline,
+) -> Vec<(At, At, u8, &'a Span)> {
+    let joined: Vec<(At, At, Ticks, Ticks, &Span)> = spans
         .iter()
-        .filter(|span| matches!(span.kind, SpanKind::Slur))
+        .filter(|span| is(&span.kind))
         .filter_map(|span| {
             let events = voices.get(&span.voice)?;
             let start = timeline.absolute(span.measure, span.at);
             let end = start + span.duration;
             let &(first_at, first) = events.iter().find(|(at, _)| at + SLACK >= start)?;
             let &(last_at, last) = events.iter().rev().find(|(at, _)| *at <= end + SLACK)?;
-            (first_at < last_at).then_some((first, last, first_at, last_at))
+            (first_at < last_at).then_some((first, last, first_at, last_at, span))
         })
         .collect();
-    let intervals: Vec<(Ticks, Ticks)> = slurs.iter().map(|&(.., start, end)| (start, end)).collect();
-    slurs
-        .iter()
+    let intervals: Vec<(Ticks, Ticks)> = joined.iter().map(|&(_, _, start, end, _)| (start, end)).collect();
+    joined
+        .into_iter()
         .zip(number_overlapping(&intervals))
-        .for_each(|(&(first, last, ..), number)| {
-            event_mut(staff, first).slurs.push(Slur { number, start: true });
-            event_mut(staff, last).slurs.push(Slur { number, start: false });
-        });
+        .map(|((first, last, _, _, span), number)| (first, last, number, span))
+        .collect()
 }
 
 /// Numbers for intervals so that intervals that overlap get different ones,
@@ -336,27 +382,40 @@ fn number_overlapping(intervals: &[(Ticks, Ticks)]) -> Vec<u8> {
 
 /// Hairpins, octave lines and pedal lines as a start and a stop direction.
 fn lines(staff: &mut Staff, spans: &[Span], timeline: &Timeline) {
+    let brackets: Vec<usize> = (0..spans.len())
+        .filter(|&i| matches!(spans[i].kind, SpanKind::Line(_)))
+        .collect();
+    let intervals: Vec<(Ticks, Ticks)> = brackets
+        .iter()
+        .map(|&i| {
+            let start = timeline.absolute(spans[i].measure, spans[i].at);
+            (start, start + spans[i].duration)
+        })
+        .collect();
+    let numbers: BTreeMap<usize, u8> = brackets.into_iter().zip(number_overlapping(&intervals)).collect();
     let directions: Vec<(usize, Direction)> = spans
         .iter()
-        .filter_map(|span| {
-            let (start, stop) = match span.kind {
-                SpanKind::Wedge(kind) => (DirectionKind::Wedge(kind), DirectionKind::Wedge("stop")),
-                SpanKind::Octave { kind, size } => (
-                    DirectionKind::OctaveShift { kind, size },
-                    DirectionKind::OctaveShift { kind: "stop", size },
+        .enumerate()
+        .filter_map(|(index, span)| {
+            let (start, stop) = match &span.kind {
+                &SpanKind::Wedge(kind) => (vec![DirectionKind::Wedge(kind)], vec![DirectionKind::Wedge("stop")]),
+                &SpanKind::Octave { kind, size } => (
+                    vec![DirectionKind::OctaveShift { kind, size }],
+                    vec![DirectionKind::OctaveShift { kind: "stop", size }],
                 ),
-                SpanKind::Pedal { line } => (
-                    DirectionKind::Pedal { kind: "start", line },
-                    DirectionKind::Pedal { kind: "stop", line },
+                &SpanKind::Pedal { line } => (
+                    vec![DirectionKind::Pedal { kind: "start", line }],
+                    vec![DirectionKind::Pedal { kind: "stop", line }],
                 ),
+                SpanKind::Line(style) => bracket(style, numbers[&index]),
                 _ => return None,
             };
             let (end, end_at) = timeline.locate_end(timeline.absolute(span.measure, span.at) + span.duration)?;
-            let direction = |at, kind| Direction {
+            let direction = |at, kinds| Direction {
                 at,
                 voice: span.voice,
                 above: span.above,
-                kinds: vec![kind],
+                kinds,
                 tempo: None,
             };
             Some([
@@ -369,6 +428,21 @@ fn lines(staff: &mut Staff, spans: &[Span], timeline: &Timeline) {
     directions
         .into_iter()
         .for_each(|(measure, direction)| staff.measures[measure].directions.push(direction));
+}
+
+/// A general line as a bracket that starts with its caption, if it has one.
+fn bracket(style: &LineStyle, number: u8) -> (Vec<DirectionKind>, Vec<DirectionKind>) {
+    let end = |kind, line_end| DirectionKind::Bracket {
+        kind,
+        number,
+        line_end,
+        line_type: style.line_type,
+    };
+    let caption = style.text.iter().map(|text| text::plain_words(text, &Font::default()));
+    (
+        caption.chain([end("start", style.start)]).collect(),
+        vec![end("stop", style.end)],
+    )
 }
 
 /// The chord a span starting at `span.at` is attached to.
@@ -386,11 +460,20 @@ fn attached(staff: &Staff, span: &Span) -> Option<At> {
         .map(|index| At { measure, index })
 }
 
-/// Ornaments and articulations that trill lines and symbols add to a chord.
+/// Ornaments, articulations and arpeggios that lines and symbols add to a chord.
 fn marks(staff: &mut Staff, spans: &[Span]) {
     let marked: Vec<(At, &SpanKind)> = spans
         .iter()
-        .filter(|span| matches!(span.kind, SpanKind::Ornament(_) | SpanKind::Articulation(_)))
+        .filter(|span| {
+            matches!(
+                span.kind,
+                SpanKind::Ornament(_)
+                    | SpanKind::Articulation(_)
+                    | SpanKind::Mark(_)
+                    | SpanKind::AccidentalMark(_)
+                    | SpanKind::Arpeggio(_)
+            )
+        })
         .filter_map(|span| Some((attached(staff, span)?, &span.kind)))
         .collect();
     marked.into_iter().for_each(|(at, kind)| {
@@ -398,6 +481,9 @@ fn marks(staff: &mut Staff, spans: &[Span]) {
         match *kind {
             SpanKind::Ornament(name) if !event.ornaments.contains(&name) => event.ornaments.push(name),
             SpanKind::Articulation(bits) => event.articulations.0 |= bits,
+            SpanKind::Mark(name) if !event.marks.contains(&name) => event.marks.push(name),
+            SpanKind::AccidentalMark(name) => event.accidental_marks.push(name),
+            SpanKind::Arpeggio(direction) => event.arpeggio = Some(direction),
             _ => {}
         }
     });
@@ -455,8 +541,7 @@ mod tests {
             content: Content::Chord(vec![Note {
                 pitch,
                 chrom2: 120,
-                tie_start: false,
-                tie_stop: false,
+                ..Note::default()
             }]),
             beam,
             ..Event::default()

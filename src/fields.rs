@@ -20,6 +20,13 @@ pub trait Fields {
         }
     }
 
+    fn float(&self, name: &str) -> Option<f64> {
+        match *self.value(name)? {
+            Value::F32(bits) => Some(f64::from(f32::from_bits(bits))),
+            ref other => other.as_int().map(|n| n as f64),
+        }
+    }
+
     fn flag(&self, name: &str) -> bool {
         self.number(name).is_some_and(|n| n != 0)
     }
