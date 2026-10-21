@@ -1,0 +1,15 @@
+[package]
+name = "sib2mxl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Converts Sibelius .sib scores to MusicXML"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pfefferniels/sib2mxl"
+keywords = ["sibelius", "musicxml", "music", "notation", "converter"]
+categories = ["multimedia::encoding", "command-line-utilities"]
+
+[dependencies]
+libsib = { git = "https://github.com/pfefferniels/libsib" }
+thiserror = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib"] }
